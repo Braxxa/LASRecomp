@@ -38,7 +38,12 @@ jobs:
         shell: bash
         run: |
           ndk_version=$(python -c 'import json; print(json.load(open("android/port.json"))["ndk_version"])')
-          sdkmanager --install "ndk;$ndk_version"
+          sdkmanager_bin="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$sdkmanager_bin" ]]; then
+            sdkmanager_bin=$(find "$ANDROID_HOME/cmdline-tools" -mindepth 3 -maxdepth 3 -type f -name sdkmanager | sort -V | tail -n 1)
+          fi
+          test -x "$sdkmanager_bin"
+          "$sdkmanager_bin" --install "ndk;$ndk_version"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk_version" >> "$GITHUB_ENV"
       - name: Cross-compile Android ARM64 core
         run: python tools/android/check_candidate.py

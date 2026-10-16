@@ -88,9 +88,10 @@ demorarla). Las ejecuciones diarias/manuales preparan un candidato aislado,
 compilan el mismo subconjunto nativo y guardan informe/bundle por 14 dias.
 No generan APK ni promueven versiones estables en esta etapa.
 
-**Todavia no esta activa:** este repositorio es local y no tiene remoto `origin`.
-Para activarla hay que publicar el fork en la cuenta del usuario, configurar
-`codex/android` como rama predeterminada y habilitar Actions si corresponde.
+El fork esta publicado en [Braxxa/LASRecomp](https://github.com/Braxxa/LASRecomp),
+con `codex/android` como rama predeterminada y Actions habilitado.
+El remoto local `origin` apunta a ese fork. Los resultados se consultan en
+[GitHub Actions](https://github.com/Braxxa/LASRecomp/actions/workflows/android.yml).
 Los cron de Actions se ejecutan desde la rama predeterminada. El flujo usa solo
 permisos de lectura; no puede modificar ramas ni crear releases. No precisa
 subir archivos del juego, codigo generado ni claves de firma.
