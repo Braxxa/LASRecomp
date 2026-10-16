@@ -1,0 +1,56 @@
+name: Android core and upstream updates
+
+on:
+  push:
+    branches: [codex/android, codex/android-testing]
+  pull_request:
+    branches: [codex/android]
+  workflow_dispatch:
+  schedule:
+    - cron: '17 9 * * *'
+
+# Scheduled runs prepare downloadable candidates; they never push or publish stable.
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  android-core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Exercise merges and conflict handling
+        run: python tools/android/test_sync.py
+      - name: Prepare isolated upstream candidate
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: python tools/android/sync_upstream.py prepare
+      - name: Install pinned NDK
+        shell: bash
+        run: |
+          ndk_version=$(python -c 'import json; print(json.load(open("android/port.json"))["ndk_version"])')
+          sdkmanager --install "ndk;$ndk_version"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk_version" >> "$GITHUB_ENV"
+      - name: Cross-compile Android ARM64 core
+        run: python tools/android/check_candidate.py
+      - name: Save reports and candidate source bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-core-${{ github.run_id }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            build/android/core/result.json
+            build/android/upstream/latest.json
+            build/android/upstream/*.bundle
+            build/android/upstream/candidate-*/build/android/core/result.json

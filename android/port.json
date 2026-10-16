@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "upstream_url": "https://github.com/peiikai/LASRecomp.git",
+  "upstream_branch": "main",
+  "upstream_base": "6244eb9d4d3497094e21cac7dabe998ded1f2800",
+  "development_branch": "codex/android",
+  "testing_branch": "codex/android-testing",
+  "stable_branch": "codex/android-stable",
+  "stage": "core-cross-compile",
+  "playable": false,
+  "device": "Retroid Pocket 6",
+  "ram_gb": 8,
+  "abi": "arm64-v8a",
+  "android_api": 33,
+  "ndk_version": "28.2.13676358"
+}
