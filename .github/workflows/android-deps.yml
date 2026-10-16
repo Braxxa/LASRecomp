@@ -1,0 +1,30 @@
+name: Build Android public dependencies
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  dependencies:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install pinned NDK
+        shell: bash
+        run: |
+          ndk_version=$(python3 -c 'import json; print(json.load(open("android/port.json"))["ndk_version"])')
+          sdkmanager_bin="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$sdkmanager_bin" ]]; then
+            sdkmanager_bin=$(find "$ANDROID_HOME/cmdline-tools" -mindepth 3 -maxdepth 3 -type f -name sdkmanager | sort -V | tail -n 1)
+          fi
+          "$sdkmanager_bin" --install "ndk;$ndk_version"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk_version" >> "$GITHUB_ENV"
+      - name: Build FFmpeg, shaderc and headers
+        run: bash tools/android/build_deps.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-public-deps-arm64
+          retention-days: 14
+          path: build/android/deps/
