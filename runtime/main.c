@@ -1,5 +1,9 @@
 // LAS Recomp entry: load modules, set up the kernel, run nn::init::Start on the main thread.
 #include <SDL3/SDL.h>
+#include <limits.h>
+#ifdef __ANDROID__
+#include <SDL3/SDL_main.h>
+#endif
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +42,11 @@ static void rtld_init_main(Cpu *c) { module_init(c, &g_modules[0]); }
 // regions at random addresses in the same window; on a collision, re-exec for a fresh layout.
 __attribute__((constructor(101))) static void reserve_guest_space(void) {
     if (plat_reserve_guest(GUEST_LO, GUEST_HI)) return;
+#ifdef __ANDROID__
+    // There is no exec of an Android Activity. Fail visibly instead of re-executing app_process.
+    fprintf(stderr, "FATAL: Android guest address range is occupied\n");
+    abort();
+#endif
     const char *tries = getenv("LARECOMP_REEXEC");
     int n = tries ? atoi(tries) : 0;
     if (n >= 20) {
@@ -168,13 +177,23 @@ int main(int argc, char **argv) {
 #endif
     const char *root = "extracted";  // (in the data root)
     bool skip_launcher = getenv("LARECOMP_NO_LAUNCHER") || getenv("LARECOMP_INPUT");  // tests boot straight in
-    static char arg_root[1024];
+    static char arg_root[PATH_MAX];
+#ifdef __ANDROID__
+    bool android_probe_mode = false;
+#endif
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--play")) skip_launcher = true;
+#ifdef __ANDROID__
+        else if (!strcmp(argv[i], "--android-probe")) android_probe_mode = true;
+#endif
         else if (argv[i][0] != '-' && !realpath(argv[i], arg_root)) root = argv[i];  // (relative to where we started)
         else if (argv[i][0] != '-') root = arg_root;
     }
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
+#ifdef __ANDROID__
+    if (android_probe_mode) { extern int android_graphics_probe(void); return android_graphics_probe(); }
+    { extern void android_prepare_game(const char *root); android_prepare_game(root); }
+#endif
     for (bool title = !skip_launcher;;) {
         if (title) {  // start screen (runtime/ui/launcher.mm): game files setup, seed choice, settings
             extern void launcher_run(const char *root);
@@ -183,6 +202,9 @@ int main(int argc, char **argv) {
         boot(root);
         int kind = ui_run();  // window and input on the main thread; returns when a reboot is requested
         teardown();
+#ifdef __ANDROID__
+        if (kind == RT_REBOOT_TITLE) return 0;  // SDLActivity finishes back to the Android launcher.
+#endif
         title = kind == RT_REBOOT_TITLE;
     }
 }

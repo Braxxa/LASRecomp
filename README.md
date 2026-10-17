@@ -19,6 +19,12 @@ native Windows, macOS and Linux application.
 > - Linux aarch64 (ARM) - **experimental**: built but untested on real hardware; reports welcome
 >   ([docs/linux.md](docs/linux.md) lists what to include)
 
+**Android fork:** an experimental ARM64 port for Retroid Pocket 6 is under development on
+`codex/android`. See [Android build, device results and update process](android/README.md).
+Public CI APKs contain the runtime only; a playable personal APK must be built locally
+from your own game files. The first room and Mabe Village have been exercised on hardware;
+this is not a claim of full-game compatibility.
+
 ![Mabe Village in a 21:9 window: the unlocked aspect ratio shows more of the island](docs/ultrawide.jpg)
 
 > [!NOTE]

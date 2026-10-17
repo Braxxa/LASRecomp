@@ -21,7 +21,8 @@
 //  - clip space exactly as the MSL output (key->flip_y / depth_minus_one epilogue unchanged): the renderer uses
 //    a negative-height viewport so Vulkan matches Metal's y-up NDC, clip z in [0, 1].
 //  - compute: `layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;` (spec constants 0..2).
-//  - extensions: GL_EXT_shader_explicit_arithmetic_types_int64 (64-bit carry / address math -> shaderInt64),
+//  - 64-bit carry / address math uses low/high uint pairs (shaderInt64 is not required).
+//  - extensions:
 //    GL_KHR_shader_subgroup_basic/_shuffle/_shuffle_relative (SHFL, FSWZADD lane: fragment/compute subgroup
 //    support), GL_EXT_texture_shadow_lod (explicit-LOD array / cube shadow lookups).
 //  - not in GLSL: the maxwell_dbg_vs position dump (buffer 29) is MSL only.
@@ -44,7 +45,7 @@ typedef struct {
     bool flip_x;            // mirror the image left to right (mirror mode's scene composite). (In the padding
                             // after flip_y: keys without it hash as before - shader caches stay valid.)
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
-    uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
+    uint8_t glsl;           // 0 MSL, 1 Vulkan GLSL, 2 GLSL with portable graphics storage mapping
 } ShaderKey;
 
 typedef struct {

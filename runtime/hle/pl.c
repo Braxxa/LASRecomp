@@ -114,7 +114,7 @@ static void load_fonts(void) {
                          "fonts/nintendo_udsgr_std_003.ttf", "fonts/nintendo_udsgr_std_003.bfttf",
                          "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc", "C:/Windows/Fonts/YuGothR.ttc",
                          "C:/Windows/Fonts/YuGothM.ttc", "/System/Library/Fonts/Supplemental/Arial.ttf",
-                         "C:/Windows/Fonts/arial.ttf",
+                         "C:/Windows/Fonts/arial.ttf", "third_party/fonts/DejaVu/DejaVuSans.ttf",
                          // Linux: DejaVu Sans (Debian / Ubuntu, Arch, Fedora). Not Noto Sans CJK: CFF outlines,
                          // which the game's font engine crashes on (it wants TrueType)
                          "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf",

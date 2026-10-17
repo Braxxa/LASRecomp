@@ -19,6 +19,10 @@ VkG g_vk;
 static SDL_Window *window;
 static atomic_bool ui_ready;
 static VkDebugUtilsMessengerEXT messenger;
+#ifdef __ANDROID__
+static bool android_surface_lost;
+extern bool android_app_is_active(void);
+#endif
 
 // ================================================================== instance / device
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type,
@@ -176,12 +180,42 @@ static void create_device(void) {
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
                                            .pNext = &f11};
     VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fault ? (void *)&ff : (void *)&f11};
+    // Mobile drivers need not expose every optional desktop feature. Request only what exists,
+    // and report missing backend requirements before vkCreateDevice fails without context.
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT adiv = {.sType = div.sType};
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT acbc = {.sType = cbc.sType, .pNext = g_vk.divisor ? &adiv : NULL};
+    VkPhysicalDeviceVulkan13Features a13 = {.sType = f13.sType,
+        .pNext = g_vk.custom_border ? (void *)&acbc : g_vk.divisor ? (void *)&adiv : NULL};
+    VkPhysicalDeviceVulkan12Features a12 = {.sType = f12.sType, .pNext = &a13};
+    VkPhysicalDeviceVulkan11Features a11 = {.sType = f11.sType, .pNext = &a12};
+    VkPhysicalDeviceFaultFeaturesEXT aff = {.sType = ff.sType, .pNext = &a11};
+    have.pNext = fault ? (void *)&aff : (void *)&a11;
+    vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+    if (!a13.dynamicRendering || !a13.synchronization2 || !a12.timelineSemaphore)
+        FATAL("Vulkan driver lacks dynamicRendering, synchronization2 or timelineSemaphore\n");
+    f11.storageBuffer16BitAccess &= a11.storageBuffer16BitAccess;
+    f12.shaderInt8 &= a12.shaderInt8;
+    f12.samplerMirrorClampToEdge &= a12.samplerMirrorClampToEdge;
+    f12.uniformAndStorageBuffer8BitAccess &= a12.uniformAndStorageBuffer8BitAccess;
+    f12.storageBuffer8BitAccess &= a12.storageBuffer8BitAccess;
+    f12.scalarBlockLayout &= a12.scalarBlockLayout;
+    f13.shaderDemoteToHelperInvocation &= a13.shaderDemoteToHelperInvocation;
+    f13.shaderTerminateInvocation &= a13.shaderTerminateInvocation;
+    f13.maintenance4 &= a13.maintenance4;
+    div.vertexAttributeInstanceRateDivisor &= adiv.vertexAttributeInstanceRateDivisor;
+    cbc.customBorderColors &= acbc.customBorderColors;
+    cbc.customBorderColorWithoutFormat &= acbc.customBorderColorWithoutFormat;
+    ff.deviceFault &= aff.deviceFault;
+    g_fault_ext = fault && ff.deviceFault;
+    g_vk.divisor = g_vk.divisor && div.vertexAttributeInstanceRateDivisor;
+    g_vk.custom_border = g_vk.custom_border && cbc.customBorderColors && cbc.customBorderColorWithoutFormat;
     VkPhysicalDeviceFeatures *b = &f.features, *h = &have.features;
     b->independentBlend = h->independentBlend;
     b->dualSrcBlend = h->dualSrcBlend;
     b->fillModeNonSolid = h->fillModeNonSolid;
     b->samplerAnisotropy = h->samplerAnisotropy;
     b->textureCompressionBC = h->textureCompressionBC;
+    b->textureCompressionASTC_LDR = h->textureCompressionASTC_LDR;
     b->shaderInt64 = h->shaderInt64;
     b->depthBiasClamp = h->depthBiasClamp;
     b->depthClamp = h->depthClamp;
@@ -193,7 +227,7 @@ static void create_device(void) {
     b->vertexPipelineStoresAndAtomics = h->vertexPipelineStoresAndAtomics;
     b->robustBufferAccess = h->robustBufferAccess;  // guest shaders index cbufs freely: keep OOB reads harmless
     b->shaderClipDistance = h->shaderClipDistance;
-    if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
+    if (!h->shaderInt64) LOG("[vk] shaderInt64 unavailable; translated shaders use paired uint32 arithmetic\n");
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
                                   .queueCount = 1, .pQueuePriorities = &prio};
@@ -271,7 +305,11 @@ static VkPresentModeKHR present_mode(void) {
 
 static void create_swapchain(void) {
     VkSurfaceCapabilitiesKHR caps;
-    VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps));
+    VkResult cap_result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps);
+#ifdef __ANDROID__
+    if (cap_result == VK_ERROR_SURFACE_LOST_KHR) { android_surface_lost = true; return; }
+#endif
+    VK_CHECK(cap_result);
     int w, h;
     SDL_GetWindowSizeInPixels(window, &w, &h);
     VkExtent2D ext = caps.currentExtent.width != UINT32_MAX ? caps.currentExtent : (VkExtent2D){(uint32_t)w, (uint32_t)h};
@@ -293,10 +331,21 @@ static void create_swapchain(void) {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = g_vk.surface, .minImageCount = count,
         .imageFormat = sf.format, .imageColorSpace = sf.colorSpace, .imageExtent = ext, .imageArrayLayers = 1,
         .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        // The renderer produces unrotated window coordinates. Android's current transform
+        // may be 90 degrees even in a landscape Activity; ask the compositor to handle it.
+        .preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+            ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = present_mode(), .clipped = VK_TRUE,
         .oldSwapchain = old};
-    VK_CHECK(vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swapchain));
+    VkSwapchainKHR next;
+    VkResult created = vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &next);
+#ifdef __ANDROID__
+    if (created == VK_ERROR_SURFACE_LOST_KHR) { android_surface_lost = true; return; }
+    if (created == VK_ERROR_OUT_OF_DATE_KHR) return;
+#endif
+    VK_CHECK(created);
+    g_vk.swapchain = next;
     for (uint32_t i = 0; i < g_vk.sc_count; i++) vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);
     if (old) vkDestroySwapchainKHR(g_vk.dev, old, NULL);
     g_vk.sc_format = sf.format;
@@ -322,6 +371,24 @@ static void recreate_swapchain(void) {
 static VkSemaphore acquire_sem[FRAMES], done_sem[8];
 static uint64_t slot_seq[FRAMES];
 static int slot;
+#ifdef __ANDROID__
+static bool android_restore_surface(void) {
+    vkDeviceWaitIdle(g_vk.dev);
+    for (uint32_t i=0;i<g_vk.sc_count;i++) vkDestroyImageView(g_vk.dev,g_vk.sc_views[i],NULL);
+    g_vk.sc_count=0;
+    if (g_vk.swapchain) vkDestroySwapchainKHR(g_vk.dev,g_vk.swapchain,NULL);
+    g_vk.swapchain=VK_NULL_HANDLE;
+    if (g_vk.surface) vkDestroySurfaceKHR(g_vk.inst,g_vk.surface,NULL);
+    g_vk.surface=VK_NULL_HANDLE;
+    for(int i=0;i<FRAMES;i++) { if(acquire_sem[i]) vkDestroySemaphore(g_vk.dev,acquire_sem[i],NULL); acquire_sem[i]=VK_NULL_HANDLE; slot_seq[i]=0; }
+    for(int i=0;i<8;i++) { if(done_sem[i]) vkDestroySemaphore(g_vk.dev,done_sem[i],NULL); done_sem[i]=VK_NULL_HANDLE; }
+    if (!SDL_Vulkan_CreateSurface(window,g_vk.inst,NULL,&g_vk.surface)) return false;
+    android_surface_lost=false;
+    create_swapchain();
+    LOG("[android] restored Vulkan surface after Activity resume\n");
+    return !android_surface_lost && g_vk.swapchain;
+}
+#endif
 
 static VkSemaphore binary_semaphore(void) {
     VkSemaphoreCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
@@ -349,6 +416,10 @@ static Frame cur_frame;
 // nothing to draw into (minimised window).
 bool vk_frame_begin(const float clear[4]) {
     cur_frame.ok = false;
+#ifdef __ANDROID__
+    while (!android_app_is_active()) SDL_Delay(25);
+    if (android_surface_lost && !android_restore_surface()) return false;
+#endif
     int w, h;
     SDL_GetWindowSizeInPixels(window, &w, &h);
     if (!w || !h) return false;  // minimised
@@ -361,6 +432,9 @@ bool vk_frame_begin(const float clear[4]) {
     if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
     vk_wait_seq(slot_seq[slot]);
     VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+#ifdef __ANDROID__
+    if (r == VK_ERROR_SURFACE_LOST_KHR) { android_surface_lost=true; return false; }
+#endif
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
         r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
@@ -433,6 +507,9 @@ void vk_frame_end(const char *shot_path) {
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &done_sem[img],
                            .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
     VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
+#ifdef __ANDROID__
+    if (r == VK_ERROR_SURFACE_LOST_KHR) android_surface_lost=true;
+#endif
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) recreate_swapchain();
     cur_frame.ok = false;
     if (shot_path) {
@@ -447,6 +524,10 @@ void vk_frame_end(const char *shot_path) {
 }
 
 void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) {
+#ifdef __ANDROID__
+    char absolute[1400];
+    if (path[0] != '/') { snprintf(absolute,sizeof absolute,"%s/%s",rt_data_root(),path); path=absolute; }
+#endif
     SDL_Surface *s = SDL_CreateSurfaceFrom((int)w, (int)h, SDL_PIXELFORMAT_ABGR8888, (void *)rgba, (int)w * 4);
     if (!s || !SDL_SavePNG(s, path)) LOG("[vk] saving %s failed: %s\n", path, SDL_GetError());
     else LOG("[vk] saved %s (%ux%u)\n", path, w, h);
@@ -477,6 +558,9 @@ void backend_represent(void) {
 }
 
 void backend_present(NvnTexture *t) {
+#ifdef __ANDROID__
+    { static bool shown; if (!shown) { extern void android_set_status(const char *message); android_set_status(""); shown = true; } }
+#endif
     g_last_presented = t;
     TexBackend *b = vk_tex(t, true);
     b->presented = true;
@@ -643,6 +727,10 @@ void ui_window_init(void) {
     int win_w = 1280, win_h = 720;
     if (getenv("LARECOMP_WINDOW")) sscanf(getenv("LARECOMP_WINDOW"), "%dx%d", &win_w, &win_h);
     SDL_WindowFlags wflags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#ifdef __ANDROID__
+    wflags |= SDL_WINDOW_FULLSCREEN;
+    g_settings.fullscreen = true;
+#endif
     if (getenv("LARECOMP_HIDDEN")) wflags |= SDL_WINDOW_HIDDEN;
     {   // scripted test runs (user input ignored: runtime/hle/input.c input_user_blocked) open without taking the
         // keyboard focus from whatever the player is doing

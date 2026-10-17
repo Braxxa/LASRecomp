@@ -85,6 +85,8 @@ def main():
         extract_entry(nsp, tickets[0], private / "title.tik")
         command += ["--tik", str(private / "title.tik")]
     command += ["--part0", str(out / "exefs"), "--part1", str(out / "romfs"), str(private / "program.nca")]
+    (out / "exefs").mkdir(parents=True, exist_ok=True)
+    (out / "romfs").mkdir(parents=True, exist_ok=True)
     print("Extracting local executable and filesystem partitions...", flush=True)
     # Run beside the user's title.keys; never copy it into source or print its contents.
     result = subprocess.run(command, cwd=key_folder, capture_output=True)

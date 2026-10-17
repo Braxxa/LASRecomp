@@ -404,6 +404,10 @@ static void fill_state(Cpu *c) {
     }
     bool menu = menu_input_captured();  // the overlay menu / name entry has the controls (typing there isn't for the game)
     uint64_t b = menu ? script_buttons : key_buttons | pad_buttons | script_buttons;
+    if (ENV("LARECOMP_LOG_INPUT")) {
+        static uint64_t previous;
+        if (b != previous) { LOG("[input] guest buttons=%llx captured=%d\n",(unsigned long long)b,menu); previous=b; }
+    }
     {   // injected Plus: held for ~10 presented frames (the game polls several times per frame)
         extern uint64_t renderer_present_count(void);
         static uint64_t until;

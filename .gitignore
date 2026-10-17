@@ -17,3 +17,7 @@ tools/venv/
 venv/
 __pycache__/
 .DS_Store
+android/app/.gradle/
+android/app/build/
+android/app/app/build/
+android/app/local.properties

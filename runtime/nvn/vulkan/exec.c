@@ -468,6 +468,9 @@ static int new_chunk(uint64_t size) {
                                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO,
                                   .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+#ifdef __ANDROID__
+    ai.requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+#endif
     if (getenv("LARECOMP_VK_RING_SYSMEM")) ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;  // (test: a GPU without resizable BAR)
     VmaAllocationInfo info;
     VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &c->buf, &c->mem, &info));
@@ -512,6 +515,7 @@ VkSpan vk_transient(uint64_t size, uint64_t align) {
 // GPU -> CPU copies: the ring is write-combined (often device-local over the BAR), where CPU reads crawl (a
 // 1280x720 screenshot took 7 s). Readbacks use one host-cached buffer instead. Every user waits for the GPU and
 // reads the data before the next readback (render thread), so a single grow-only buffer suffices.
+static VmaAllocation readback_allocation;
 VkSpan vk_readback(uint64_t size) {
     static VkBuffer buf;
     static VmaAllocation mem;
@@ -525,6 +529,7 @@ VkSpan vk_readback(uint64_t size) {
                                       .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
         VmaAllocationInfo info;
         VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &buf, &mem, &info));
+        readback_allocation = mem;
         ptr = info.pMappedData;
     }
     return (VkSpan){buf, 0, ptr};
@@ -1971,6 +1976,72 @@ static VmaAllocation gfast_mem;
 static uint32_t gmap_tab[(GMAP_MAX + 1) * 4];  // this dispatch's table (stage_set copies it into binding 20)
 static VkBufferCopy gfast_cp[GMAP_MAX];       // its copies heap -> gfast_buf (reversed after a storing dispatch)
 static int gfast_n;
+static VkDescriptorBufferInfo graphics_storage;
+static VkSpan graphics_span;
+static VkBufferCopy graphics_ranges[GMAP_MAX];
+static int graphics_range_count;
+
+// Without host-pointer import, graphics LDG/STG also needs real storage, not the
+// zero fallback heap. Pack its bound ranges into this draw's coherent upload slice.
+static void graphics_storage_prepare(bool vertex, bool fragment) {
+    struct { uint64_t lo, hi; } ranges[32];
+    int count = 0;
+    uint64_t heap = kernel_heap_size();
+    if (heap > HEAP_MAX) heap = HEAP_MAX;
+    for (int stage = 0; stage < 2; stage++) {
+        if (!(stage ? fragment : vertex)) continue;
+        for (int i = 0; i < 16; i++) {
+            Range b = st.sbuf[stage][i];
+            if (!b.addr || !b.size || b.addr < HEAP_BASE || b.addr - HEAP_BASE + b.size > heap) continue;
+            uint64_t lo = (b.addr - HEAP_BASE) & ~255ull;
+            uint64_t hi = (b.addr - HEAP_BASE + b.size + 255) & ~255ull;
+            if (hi > heap) hi = heap;
+            int k = count++;
+            while (k && ranges[k-1].lo > lo) { ranges[k] = ranges[k-1]; k--; }
+            ranges[k].lo = lo; ranges[k].hi = hi;
+        }
+    }
+    int merged = 0;
+    for (int i = 0; i < count; i++) {
+        if (merged && ranges[i].lo <= ranges[merged-1].hi + 256) {
+            if (ranges[i].hi > ranges[merged-1].hi) ranges[merged-1].hi = ranges[i].hi;
+        } else ranges[merged++] = ranges[i];
+    }
+    memset(gmap_tab,0,sizeof gmap_tab);
+    graphics_range_count = 0;
+    uint64_t bytes = 0;
+    for (int i = 0; i < merged; i++) bytes += (ranges[i].hi-ranges[i].lo+255) & ~255ull;
+    if (merged > GMAP_MAX || bytes > GFAST_SIZE || bytes > g_vk.props.limits.maxStorageBufferRange)
+        FATAL("graphics storage ranges exceed mobile upload capacity (%d, %llu bytes)\n",merged,(unsigned long long)bytes);
+    graphics_span = vk_transient(bytes ? bytes : 16,256);
+    graphics_storage = (VkDescriptorBufferInfo){graphics_span.buf,graphics_span.off,bytes ? bytes : 16};
+    uint64_t offset = 0;
+    for (int i = 0; i < merged; i++) {
+        uint64_t length = ranges[i].hi-ranges[i].lo;
+        memcpy((uint8_t *)graphics_span.ptr+offset,(const void *)(uintptr_t)(HEAP_BASE+ranges[i].lo),length);
+        gmap_tab[i*4] = (uint32_t)ranges[i].lo;
+        gmap_tab[i*4+1] = (uint32_t)length;
+        gmap_tab[i*4+2] = (uint32_t)(offset>>2);
+        graphics_ranges[i] = (VkBufferCopy){ranges[i].lo,offset,length};
+        offset += (length+255)&~255ull;
+    }
+    gmap_tab[GMAP_MAX*4] = (uint32_t)merged;
+    graphics_range_count = merged;
+    static int logged;
+    if (logged++ < 6) LOG("[vk] graphics storage upload: %d ranges, %llu bytes\n",merged,(unsigned long long)bytes);
+}
+
+static void graphics_storage_finish(void) {
+    vk_end_pass();
+    VkMemoryBarrier2 barrier = {.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,.srcStageMask=VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
+        .srcAccessMask=VK_ACCESS_2_SHADER_WRITE_BIT,.dstStageMask=VK_PIPELINE_STAGE_2_HOST_BIT,.dstAccessMask=VK_ACCESS_2_HOST_READ_BIT};
+    VkDependencyInfo dependency = {.sType=VK_STRUCTURE_TYPE_DEPENDENCY_INFO,.memoryBarrierCount=1,.pMemoryBarriers=&barrier};
+    vkCmdPipelineBarrier2(vk_cmd(),&dependency);
+    renderer_flush();
+    for (int i=0;i<graphics_range_count;i++)
+        memcpy((void *)(uintptr_t)(HEAP_BASE+graphics_ranges[i].srcOffset),
+            (const uint8_t *)graphics_span.ptr+graphics_ranges[i].dstOffset,graphics_ranges[i].size);
+}
 
 static VkDescriptorBufferInfo gfast_info(void) {
     if (!gfast_buf) {
@@ -1990,14 +2061,16 @@ static void gfast_prepare(VkCommandBuffer cb) {
     gfast_n = 0;
     gmem_info();  // (the heap import, made on first use)
     gfast_info();
-    if (!on || !gmem_buf) return;
+    if (!on) return;
+    uint64_t heap_size = gmem_buf ? gmem_size : kernel_heap_size();
+    if (heap_size > HEAP_MAX) heap_size = HEAP_MAX;
     struct { uint64_t lo, hi; } r[16];
     int n = 0;
     for (int i = 0; i < 16; i++) {  // heap offsets of the bound storage buffers, 256-aligned
         uint64_t a = st.sbuf[5][i].addr, sz = st.sbuf[5][i].size;
-        if (!a || !sz || a < HEAP_BASE || a - HEAP_BASE + sz > gmem_size) continue;
+        if (!a || !sz || a < HEAP_BASE || a - HEAP_BASE + sz > heap_size) continue;
         uint64_t lo = (a - HEAP_BASE) & ~255ull, hi = (a - HEAP_BASE + sz + 255) & ~255ull;
-        if (hi > gmem_size) hi = gmem_size;
+        if (hi > heap_size) hi = heap_size;
         int k = n++;
         while (k > 0 && r[k - 1].lo > lo) { r[k] = r[k - 1]; k--; }  // (insertion sort by start)
         r[k].lo = lo; r[k].hi = hi;
@@ -2027,7 +2100,18 @@ static void gfast_prepare(VkCommandBuffer cb) {
             LOG("\n");
         }
     }
-    vkCmdCopyBuffer(cb, gmem_buf, gfast_buf, (uint32_t)m, cp);
+    if (gmem_buf) vkCmdCopyBuffer(cb, gmem_buf, gfast_buf, (uint32_t)m, cp);
+    else {
+        // Android drivers usually cannot import arbitrary host pointers. Upload only this
+        // dispatch's bound ranges; allocating a second multi-GB guest heap is unnecessary.
+        static bool logged;
+        if (!logged) { LOG("[vk] shader storage buffers use upload/readback (no host import)\n"); logged = true; }
+        for (int i = 0; i < m; i++) {
+            VkSpan s = vk_transient_copy((const void *)(uintptr_t)(HEAP_BASE + cp[i].srcOffset), cp[i].size, 256);
+            VkBufferCopy copy = {s.off, cp[i].dstOffset, cp[i].size};
+            vkCmdCopyBuffer(cb, s.buf, gfast_buf, 1, &copy);
+        }
+    }
     vk_full_barrier(cb);
     gmap_tab[GMAP_MAX * 4] = (uint32_t)m;
     memcpy(gfast_cp, cp, (size_t)m * sizeof cp[0]);
@@ -2037,6 +2121,25 @@ static void gfast_prepare(VkCommandBuffer cb) {
 // After a storing dispatch: its ranges back to the heap (before anything else reads them: draws, the CPU after the fence).
 static void gfast_finish(VkCommandBuffer cb) {
     if (!gfast_n) return;
+    if (!gmem_buf) {
+        // Complete writes before the CPU or a subsequent guest buffer upload reads them.
+        // This conservative path trades a fence per storing dispatch for correct visibility.
+        uint64_t size = gfast_cp[gfast_n - 1].dstOffset + gfast_cp[gfast_n - 1].size;
+        VkSpan out = vk_readback(size);
+        VkBufferCopy copy[GMAP_MAX];
+        for (int i = 0; i < gfast_n; i++)
+            copy[i] = (VkBufferCopy){gfast_cp[i].dstOffset, gfast_cp[i].dstOffset, gfast_cp[i].size};
+        vk_full_barrier(cb);
+        vkCmdCopyBuffer(cb, gfast_buf, out.buf, (uint32_t)gfast_n, copy);
+        vk_full_barrier(cb);
+        renderer_flush();
+        vmaInvalidateAllocation(g_vk.vma, readback_allocation, 0, VK_WHOLE_SIZE);
+        for (int i = 0; i < gfast_n; i++)
+            memcpy((void *)(uintptr_t)(HEAP_BASE + gfast_cp[i].srcOffset),
+                   (const uint8_t *)out.ptr + gfast_cp[i].dstOffset, gfast_cp[i].size);
+        gfast_n = 0;
+        return;
+    }
     VkBufferCopy back[GMAP_MAX];
     for (int i = 0; i < gfast_n; i++) back[i] = (VkBufferCopy){gfast_cp[i].dstOffset, gfast_cp[i].srcOffset, gfast_cp[i].size};
     vk_full_barrier(cb);
@@ -2378,7 +2481,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
             w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
-            bi[n] = b->binding == GFAST_BUFFER_INDEX ? gfast_info() : gmem_info();
+            bi[n] = b->binding == GFAST_BUFFER_INDEX ? (stage < 2 && !g_vk.host_import ? graphics_storage : gfast_info()) : gmem_info();
             w[n].pBufferInfo = &bi[n];
         } else {
             continue;  // rscale / tint: written below, once the textures (and their scales) are known
@@ -2556,7 +2659,7 @@ static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_tp_ = SDL_GetTicksNS();
     if (!st.program) { stat_skipped++; return; }
     ShaderKey vkey = {0}, fkey = {0};
-    vkey.glsl = fkey.glsl = 1;
+    vkey.glsl = fkey.glsl = g_vk.host_import ? 1 : 2;
     vkey.flip_y = fkey.flip_y = nvn_window_origin() == 0;
     vkey.depth_minus_one = nvn_depth_mode() == 0;
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
@@ -2795,6 +2898,8 @@ static void draw_(CmdRec *r, bool indexed) {
     // build the vertex set now and the fragment set after the decision (stage_set fills tex_sc for stage 1).
     if (prof) prof_dyn += SDL_GetTicksNS() - prof_td_;
     PROF_T0();
+    if (!g_vk.host_import && (pr->vi->uses_gmem_map || pr->fi->uses_gmem_map))
+        graphics_storage_prepare(pr->vi->uses_gmem_map,pr->fi->uses_gmem_map);
     VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL);
     PROF_ADD(prof_sets);
     VkDescriptorImageInfo fii[64];
@@ -2994,6 +3099,7 @@ static void draw_(CmdRec *r, bool indexed) {
         else vkCmdDrawIndexed(cb, icount, run_n[ri], 0, base_vertex, base_inst + run_at[ri]);
     }
     stat_draws++;
+    if (!g_vk.host_import && (pr->vi->uses_gmem_store || pr->fi->uses_gmem_store)) graphics_storage_finish();
     cum_draws++;
     if (g_gpuprof_frame && gp_n) {
         if (!gp_draws[gp_n - 1]) {  // first draw of the row: its fragment shader hash
@@ -3005,6 +3111,8 @@ static void draw_(CmdRec *r, bool indexed) {
 }
 
 static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
+    for (int i=0;i<st.nattrib;i++) if (pr->vi->attr_mask & (1u<<i))
+        LOG("[draw] attribute %d packed=%x stride=%u\n",i,st.attrib[i],st.stream[(st.attrib[i]>>8)&15][0]);
     LOG("[draw] %s inst %llu mode %llu count %llu prog vs=%llx fs=%llx | vs cb %#x fs cb %#x | rt %d", indexed ? "e" : "a",
         (unsigned long long)(indexed ? r->x[6] : r->x[4]), (unsigned long long)r->x[0], (unsigned long long)r->x[2],
         (unsigned long long)st.program->stages[0].code_addr, (unsigned long long)st.program->stages[1].code_addr,

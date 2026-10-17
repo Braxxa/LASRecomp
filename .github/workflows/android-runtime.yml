@@ -1,0 +1,55 @@
+name: Android runtime APK (without game)
+on:
+  push:
+    branches: [codex/android, codex/android-testing]
+    paths: ['runtime/**', 'android/**', 'tools/android/**', 'third_party/**', '.github/workflows/android-runtime.yml']
+  pull_request:
+    branches: [codex/android]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: android-runtime-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.0'
+      - name: Install SDK tools
+        shell: bash
+        run: |
+          ndk_version=$(python -c 'import json; print(json.load(open("android/port.json"))["ndk_version"])')
+          sdkmanager_bin="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          "$sdkmanager_bin" --install "ndk;$ndk_version" 'platforms;android-34' 'build-tools;34.0.0' 'cmake;3.22.1'
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk_version" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        id: deps
+        with:
+          path: build/android/deps
+          key: android-public-deps-${{ runner.os }}-${{ hashFiles('tools/android/build_deps.sh', 'android/port.json') }}
+      - name: Build pinned public dependencies
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: bash tools/android/build_deps.sh
+      - name: Compile complete runtime and package app
+        run: python tools/android/build_apk.py --sdk "$ANDROID_HOME" --java-home "$JAVA_HOME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-runtime-without-game-${{ github.run_id }}
+          retention-days: 14
+          path: |
+            build/android/output/LASRecomp-Android-runtime.apk
+            build/android/output/build-result.json
